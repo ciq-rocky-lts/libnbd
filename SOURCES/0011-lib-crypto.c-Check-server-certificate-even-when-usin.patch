@@ -1,0 +1,32 @@
+diff --git a/lib/crypto.c b/lib/crypto.c
+index 18a6e6a87349..bea42096543f 100644
+--- a/lib/crypto.c
++++ b/lib/crypto.c
+@@ -532,13 +532,6 @@ set_up_certificate_credentials (struct nbd_handle *h,
+   return NULL;
+ 
+  found_certificates:
+-#ifdef HAVE_GNUTLS_SESSION_SET_VERIFY_CERT
+-  if (h->hostname && h->tls_verify_peer)
+-    gnutls_session_set_verify_cert (session, h->hostname, 0);
+-#else
+-  debug (h, "ignoring nbd_set_tls_verify_peer, this requires GnuTLS >= 3.4.6");
+-#endif
+-
+   err = gnutls_credentials_set (session, GNUTLS_CRD_CERTIFICATE, ret);
+   if (err < 0) {
+     set_error (0, "gnutls_credentials_set: %s", gnutls_strerror (err));
+@@ -653,6 +646,13 @@ nbd_internal_crypto_create_session (struct nbd_handle *h,
+       gnutls_deinit (session);
+       return NULL;
+     }
++#ifdef HAVE_GNUTLS_SESSION_SET_VERIFY_CERT
++  if (h->tls_verify_peer)
++    gnutls_session_set_verify_cert (session, h->hostname, 0);
++#else
++  debug (h, "ignoring nbd_set_tls_verify_peer, this requires GnuTLS >= 3.4.6");
++#endif
++
+   }
+ 
+   /* Wrap the underlying socket with GnuTLS. */
