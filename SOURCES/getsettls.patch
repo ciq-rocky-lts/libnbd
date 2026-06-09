@@ -1,0 +1,458 @@
+From 325d2535915d2d087ac9c0f1144cc329679da8ab Mon Sep 17 00:00:00 2001
+From: "Richard W.M. Jones" <rjones@redhat.com>
+Date: Tue, 25 Jun 2024 11:36:05 +0100
+Subject: [PATCH 1/4] lib/crypto.c: Add API functions to get/set TLS hostname
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Allow the TLS hostname (server name) to be optionally set independent
+of the hostname we are connecting to.  This gives more flexiblity when
+connecting to a TLS server through a proxy, allowing the server
+certificate to be verified correctly in this case.
+
+Suggested-by: Daniel Berrangé
+Reviewed-by: Daniel P. Berrangé <berrange@redhat.com>
+(cherry picked from commit 7a45b5db68c59cc620ba328f0ebec1e7058cd95a)
+---
+ .gitignore          |  1 +
+ generator/API.ml    | 36 +++++++++++++++++++++++++++++-
+ interop/Makefile.am | 25 +++++++++++++++++++++
+ interop/interop.c   |  6 +++++
+ lib/crypto.c        | 54 +++++++++++++++++++++++++++++++++++++++++++--
+ lib/handle.c        |  1 +
+ lib/internal.h      |  1 +
+ 7 files changed, 121 insertions(+), 3 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index 2311caa..899300a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -115,6 +115,7 @@ Makefile.in
+ /interop/interop-nbdkit-tls-certs-allow-enabled
+ /interop/interop-nbdkit-tls-certs-allow-fallback
+ /interop/interop-nbdkit-tls-certs-bad-CA
++/interop/interop-nbdkit-tls-certs-bad-hostname
+ /interop/interop-nbdkit-tls-psk
+ /interop/interop-nbdkit-tls-psk-allow-enabled
+ /interop/interop-nbdkit-tls-psk-allow-fallback
+diff --git a/generator/API.ml b/generator/API.ml
+index 9175310..43922a8 100644
+--- a/generator/API.ml
++++ b/generator/API.ml
+@@ -777,7 +777,8 @@ This function may be called regardless of whether TLS is
+ supported, but will have no effect unless L<nbd_set_tls(3)>
+ is also used to request or require TLS.";
+     example = Some "examples/encryption.c";
+-    see_also = [Link "get_tls_username"; Link "set_tls"];
++    see_also = [Link "get_tls_username"; Link "set_tls_hostname";
++                Link "set_tls"];
+   };
+ 
+   "get_tls_username", {
+@@ -789,6 +790,35 @@ Get the current TLS username.";
+     see_also = [Link "set_tls_username"];
+   };
+ 
++  "set_tls_hostname", {
++    default_call with
++    args = [String "hostname"]; ret = RErr;
++    permitted_states = [ Created ];
++    shortdesc = "set the TLS hostname";
++    longdesc = "\
++Set the TLS server hostname.  This is used in preference to the
++hostname supplied when connecting (eg. through L<nbd_connect_tcp(3)>),
++or when there is no explicit hostname at all (L<nbd_connect_unix(3)>).
++It can be useful when you are connecting to a proxy which is forwarding
++the data to the final server, to specify the name of the final server
++so that the server's certificate can be checked.
++
++This function may be called regardless of whether TLS is
++supported, but will have no effect unless L<nbd_set_tls(3)>
++is also used to request or require TLS.";
++    see_also = [Link "set_tls_username"; Link "set_tls"];
++  };
++
++  "get_tls_hostname", {
++    default_call with
++    args = []; ret = RString;
++    shortdesc = "get the effective TLS hostname";
++    longdesc = "\
++Get the TLS server hostname in effect.  If not set, this returns
++the empty string (not an error).";
++    see_also = [Link "set_tls_hostname"];
++  };
++
+   "set_tls_psk_file", {
+     default_call with
+     args = [Path "filename"]; ret = RErr;
+@@ -4390,6 +4420,10 @@ let first_version = [
+   "block_status_filter", (1, 18);
+   "aio_block_status_filter", (1, 18);
+ 
++  (* Added in 1.21.x development cycle, will be stable and supported in 1.22 *)
++  "set_tls_hostname", (1, 22);
++  "get_tls_hostname", (1, 22);
++
+   (* These calls are proposed for a future version of libnbd, but
+    * have not been added to any released version so far.
+   "get_tls_certificates", (1, ??);
+diff --git a/interop/Makefile.am b/interop/Makefile.am
+index 18b6a30..319f120 100644
+--- a/interop/Makefile.am
++++ b/interop/Makefile.am
+@@ -280,6 +280,7 @@ check_PROGRAMS += \
+ 	interop-nbdkit-tls-certs-allow-enabled \
+ 	interop-nbdkit-tls-certs-allow-fallback \
+ 	interop-nbdkit-tls-certs-bad-CA \
++	interop-nbdkit-tls-certs-bad-hostname \
+ 	interop-nbdkit-tls-psk \
+ 	interop-nbdkit-tls-psk-allow-enabled \
+ 	interop-nbdkit-tls-psk-allow-fallback \
+@@ -292,6 +293,7 @@ TESTS += \
+ 	interop-nbdkit-tls-certs-allow-enabled \
+ 	interop-nbdkit-tls-certs-allow-fallback \
+ 	interop-nbdkit-tls-certs-bad-CA \
++	interop-nbdkit-tls-certs-bad-hostname \
+ 	interop-nbdkit-tls-psk \
+ 	interop-nbdkit-tls-psk-allow-enabled \
+ 	interop-nbdkit-tls-psk-allow-fallback \
+@@ -390,6 +392,29 @@ interop_nbdkit_tls_certs_bad_CA_LDADD = \
+ 	$(GNUTLS_LIBS) \
+ 	$(NULL)
+ 
++# This test is expected to fail because even though the CA is correct,
++# we override tls_hostname with a bogus server name that won't match
++# the server's certificate.
++interop_nbdkit_tls_certs_bad_hostname_SOURCES = \
++	interop.c \
++	requires.c \
++	../tests/requires.h \
++	$(NULL)
++interop_nbdkit_tls_certs_bad_hostname_CPPFLAGS = \
++	$(AM_CPPFLAGS) \
++	-DREQUIRES=' requires ("test -d ../tests/pki"); ' \
++	-DSERVER=\"$(NBDKIT)\" \
++	-DSERVER_PARAMS='"--tls=require", "--tls-certificates=../tests/pki", "-s", "--exit-with-parent", "null"' \
++	-DCERTS='"../tests/pki"' \
++	-DTLS_MODE=LIBNBD_TLS_REQUIRE \
++	-DTLS_HOSTNAME='"this.is.bad.example.com"' \
++	-DEXPECT_FAIL=1 \
++	$(NULL)
++interop_nbdkit_tls_certs_bad_hostname_LDADD = \
++	$(top_builddir)/lib/libnbd.la \
++	$(GNUTLS_LIBS) \
++	$(NULL)
++
+ interop_nbdkit_tls_psk_SOURCES = \
+ 	interop.c \
+ 	requires.c \
+diff --git a/interop/interop.c b/interop/interop.c
+index 07b64b8..1ea0216 100644
+--- a/interop/interop.c
++++ b/interop/interop.c
+@@ -145,7 +145,13 @@ main (int argc, char *argv[])
+     fprintf (stderr, "%s\n", nbd_get_error ());
+     exit (EXIT_FAILURE);
+   }
++#ifdef TLS_HOSTNAME
++  if (nbd_set_tls_hostname (nbd, TLS_HOSTNAME) == -1) {
++    fprintf (stderr, "%s\n", nbd_get_error ());
++    exit (EXIT_FAILURE);
++  }
+ #endif
++#endif /* TLS */
+ 
+ #if defined(CERTS)
+   const char *certs = CERTS;
+diff --git a/lib/crypto.c b/lib/crypto.c
+index 0dbd485..e7aee21 100644
+--- a/lib/crypto.c
++++ b/lib/crypto.c
+@@ -163,6 +163,51 @@ nbd_unlocked_get_tls_username (struct nbd_handle *h)
+   }
+ }
+ 
++int
++nbd_unlocked_set_tls_hostname (struct nbd_handle *h, const char *hostname)
++{
++  char *new_hostname;
++
++  new_hostname = strdup (hostname);
++  if (!new_hostname) {
++    set_error (errno, "strdup");
++    return -1;
++  }
++  free (h->tls_hostname);
++  h->tls_hostname = new_hostname;
++  return 0;
++}
++
++static const char *
++get_tls_hostname (struct nbd_handle *h)
++{
++  if (h->tls_hostname)
++    return h->tls_hostname;
++  else if (h->hostname)
++    return h->hostname;
++  else
++    return NULL;
++}
++
++char *
++nbd_unlocked_get_tls_hostname (struct nbd_handle *h)
++{
++  const char *hostname = get_tls_hostname (h);
++  char *ret;
++
++  if (hostname)
++    ret = strdup (hostname);
++  else
++    /* Otherwise, return "" (not an error). */
++    ret = strdup ("");
++
++  if (ret == NULL) {
++    set_error (errno, "strdup");
++    return NULL;
++  }
++  return ret;
++}
++
+ int
+ nbd_unlocked_set_tls_psk_file (struct nbd_handle *h, const char *filename)
+ {
+@@ -649,8 +694,13 @@ nbd_internal_crypto_create_session (struct nbd_handle *h,
+       return NULL;
+     }
+ 
+-    if (h->tls_verify_peer)
+-      gnutls_session_set_verify_cert (session, h->hostname, 0);
++    if (h->tls_verify_peer) {
++      /* Verify the server certificate using h->tls_hostname, falling
++       * back to h->hostname.
++       */
++      const char *hostname = get_tls_hostname (h);
++      gnutls_session_set_verify_cert (session, hostname, 0);
++    }
+   }
+ 
+   /* Wrap the underlying socket with GnuTLS. */
+diff --git a/lib/handle.c b/lib/handle.c
+index 980649a..196018b 100644
+--- a/lib/handle.c
++++ b/lib/handle.c
+@@ -173,6 +173,7 @@ nbd_close (struct nbd_handle *h)
+   free (h->sact_name);
+   free (h->tls_certificates);
+   free (h->tls_username);
++  free (h->tls_hostname);
+   free (h->tls_psk_file);
+   string_vector_empty (&h->request_meta_contexts);
+   free (h->hname);
+diff --git a/lib/internal.h b/lib/internal.h
+index f446057..d1fc971 100644
+--- a/lib/internal.h
++++ b/lib/internal.h
+@@ -117,6 +117,7 @@ struct nbd_handle {
+   char *tls_certificates;       /* Certs dir, NULL = use default path */
+   bool tls_verify_peer;         /* Verify the peer certificate. */
+   char *tls_username;           /* Username, NULL = use current username */
++  char *tls_hostname;           /* TLS hostname */
+   char *tls_psk_file;           /* PSK filename, NULL = no PSK */
+ 
+   /* Extended headers. */
+-- 
+2.52.0
+
+
+From a513ce9bb3597c8c56bb7a93d7005111e26aa822 Mon Sep 17 00:00:00 2001
+From: "Richard W.M. Jones" <rjones@redhat.com>
+Date: Tue, 25 Jun 2024 11:41:40 +0100
+Subject: [PATCH 2/4] lib/uri.c: Allow tls-hostname to be overridden in URIs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Suggested-by: Daniel Berrangé
+Reviewed-by: Daniel P. Berrangé <berrange@redhat.com>
+(cherry picked from commit e62185645c4d1a833d40aa79f3fee4ed477827c2)
+---
+ generator/API.ml | 4 ++++
+ lib/uri.c        | 4 ++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/generator/API.ml b/generator/API.ml
+index 43922a8..089bea2 100644
+--- a/generator/API.ml
++++ b/generator/API.ml
+@@ -2032,6 +2032,10 @@ Note this is not allowed by default - see next section.
+ Set the PSK file.  See L<nbd_set_tls_psk_file(3)>.  Note
+ this is not allowed by default - see next section.
+ 
++=item B<tls-hostname=>C<SERVER>
++
++Set the TLS hostname.  See L<nbd_set_tls_hostname(3)>.
++
+ =item B<tls-verify-peer=false>
+ 
+ Do not verify the server certificate.  See L<nbd_set_tls_verify_peer(3)>.
+diff --git a/lib/uri.c b/lib/uri.c
+index 30a9290..7919888 100644
+--- a/lib/uri.c
++++ b/lib/uri.c
+@@ -324,6 +324,10 @@ nbd_unlocked_aio_connect_uri (struct nbd_handle *h, const char *raw_uri)
+       if (nbd_unlocked_set_tls_psk_file (h, queries.ptr[i].value) == -1)
+         goto cleanup;
+     }
++    else if (strcasecmp (queries.ptr[i].name, "tls-hostname") == 0) {
++      if (nbd_unlocked_set_tls_hostname (h, queries.ptr[i].value) == -1)
++        goto cleanup;
++    }
+     else if (strcasecmp (queries.ptr[i].name, "tls-verify-peer") == 0) {
+       int v = parse_bool ("tls-verify-peer", queries.ptr[i].value);
+       if (v == -1)
+-- 
+2.52.0
+
+
+From 7b8e59bc206e47e5fd83404aca8a177c955f2c0a Mon Sep 17 00:00:00 2001
+From: "Richard W.M. Jones" <rjones@redhat.com>
+Date: Wed, 26 Jun 2024 09:30:53 +0100
+Subject: [PATCH 3/4] lib/uri.c: Append tls-hostname and tls-verify-peer when
+ getting URI
+
+When using nbd_get_uri, append tls-hostname and tls-verify-peer if
+needed.  This also adds a simple pair of tests.
+
+Updates: commit e62185645c4d1a833d40aa79f3fee4ed477827c2
+Updates: commit 75641c6b30155abce272f60cf3518a65654aa401
+(cherry picked from commit 029352d6e84a3dc7b8d13b956b468c00d007bcd9)
+---
+ .gitignore        |  2 ++
+ lib/uri.c         | 10 ++++++++++
+ tests/Makefile.am | 34 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 46 insertions(+)
+
+diff --git a/.gitignore b/.gitignore
+index 899300a..3bc49be 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -224,6 +224,8 @@ Makefile.in
+ /tests/connect-uri-nbds-certs
+ /tests/connect-uri-nbds-psk
+ /tests/connect-uri-nbds-unix-certs
++/tests/connect-uri-nbds-unix-tls-hostname
++/tests/connect-uri-nbds-unix-tls-verify-peer-false
+ /tests/connect-uri-nbds-unix-psk
+ /tests/debug
+ /tests/debug-environment
+diff --git a/lib/uri.c b/lib/uri.c
+index 7919888..0393776 100644
+--- a/lib/uri.c
++++ b/lib/uri.c
+@@ -580,6 +580,16 @@ nbd_unlocked_get_uri (struct nbd_handle *h)
+                              "tls-psk-file", h->tls_psk_file) == -1)
+       goto out;
+   }
++  if (h->tls_hostname) {
++    if (append_query_params (&query_params,
++                             "tls-hostname", h->tls_hostname) == -1)
++      goto out;
++  }
++  if (! h->tls_verify_peer) {
++    if (append_query_params (&query_params,
++                             "tls-verify-peer", "false") == -1)
++      goto out;
++  }
+ 
+   uri.query_raw = query_params;
+ 
+diff --git a/tests/Makefile.am b/tests/Makefile.am
+index 1236164..ca0a908 100644
+--- a/tests/Makefile.am
++++ b/tests/Makefile.am
+@@ -810,10 +810,14 @@ if HAVE_CERTTOOL
+ check_PROGRAMS += \
+ 	connect-uri-nbds-certs \
+ 	connect-uri-nbds-unix-certs \
++	connect-uri-nbds-unix-tls-hostname \
++	connect-uri-nbds-unix-tls-verify-peer-false \
+ 	$(NULL)
+ TESTS += \
+ 	connect-uri-nbds-certs \
+ 	connect-uri-nbds-unix-certs \
++	connect-uri-nbds-unix-tls-hostname \
++	connect-uri-nbds-unix-tls-verify-peer-false \
+ 	$(NULL)
+ 
+ connect_uri_nbds_certs_SOURCES = \
+@@ -842,6 +846,36 @@ connect_uri_nbds_unix_certs_CPPFLAGS = \
+ 	$(NULL)
+ connect_uri_nbds_unix_certs_LDADD = $(top_builddir)/lib/libnbd.la
+ 
++connect_uri_nbds_unix_tls_hostname_SOURCES = \
++	connect-uri.c \
++	requires.c requires.h pick-a-port.c pick-a-port.h \
++	$(NULL)
++connect_uri_nbds_unix_tls_hostname_CPPFLAGS = \
++	$(AM_CPPFLAGS) \
++	-DDEFINE_STR_AS_UNIX_SOCKET=1 \
++	-DSERVER_PARAMS='"-U", str, "--tls=require", "--tls-verify-peer", "--tls-certificates=pki"' \
++	-DREQUIRES_NBDKIT_TLS_VERIFY_PEER=1 \
++	-DURI='"nbds+unix://alice@/?tls-certificates=pki&socket=%s&tls-hostname=localhost", str' \
++	$(NULL)
++connect_uri_nbds_unix_tls_hostname_LDADD = \
++	$(top_builddir)/lib/libnbd.la \
++	$(NULL)
++
++connect_uri_nbds_unix_tls_verify_peer_false_SOURCES = \
++	connect-uri.c \
++	requires.c requires.h pick-a-port.c pick-a-port.h \
++	$(NULL)
++connect_uri_nbds_unix_tls_verify_peer_false_CPPFLAGS = \
++	$(AM_CPPFLAGS) \
++	-DDEFINE_STR_AS_UNIX_SOCKET=1 \
++	-DSERVER_PARAMS='"-U", str, "--tls=require", "--tls-verify-peer", "--tls-certificates=pki"' \
++	-DREQUIRES_NBDKIT_TLS_VERIFY_PEER=1 \
++	-DURI='"nbds+unix://alice@/?tls-certificates=pki&socket=%s&tls-verify-peer=false", str' \
++	$(NULL)
++connect_uri_nbds_unix_tls_verify_peer_false_LDADD = \
++	$(top_builddir)/lib/libnbd.la \
++	$(NULL)
++
+ endif HAVE_CERTTOOL
+ 
+ if HAVE_PSKTOOL
+-- 
+2.52.0
+
+
+From b04a3f3c3c23cf4c995d8cb82f7d993e175a1d74 Mon Sep 17 00:00:00 2001
+From: "Richard W.M. Jones" <rjones@redhat.com>
+Date: Tue, 19 Aug 2025 12:30:36 +0100
+Subject: [PATCH 4/4] lib/uri.c: Add static annotation to parse_bool
+
+This is a private function, not used outside this compilation unit.
+
+Fixes: commit 75641c6b30155abce272f60cf3518a65654aa401
+(cherry picked from commit adfd9ab868f84eb853b1f2b682dcebea4cc1df7a)
+---
+ lib/uri.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/uri.c b/lib/uri.c
+index 0393776..46d1b28 100644
+--- a/lib/uri.c
++++ b/lib/uri.c
+@@ -152,7 +152,7 @@ parse_uri_queries (const char *query_raw, uri_query_list *list)
+ }
+ 
+ /* Similar to nbdkit_parse_bool */
+-int
++static int
+ parse_bool (const char *param, const char *value)
+ {
+   if (!strcmp (value, "1") ||
+-- 
+2.52.0
+
